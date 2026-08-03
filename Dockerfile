@@ -1,12 +1,73 @@
-# Use specific version of nvidia cuda image
-FROM wlsdml1114/engui_genai-base_blackwell:1.1 as runtime
+# ===========================================================================
+# Stage 1: models
+#
+# Isolated so this stage's cache survives changes to the runtime stage (new
+# custom node, handler.py edit, pip bump, etc). Docker only re-runs a stage
+# whose own inputs changed, so a code-only push skips this stage's ~40GB of
+# downloads entirely once it has built successfully once.
+#
+# `-q` instead of the verbose progress meter: less log volume, marginally
+# faster. `test -s` after every download still catches a truncated or failed
+# fetch immediately, so a bad download fails the build instead of silently
+# shipping a broken file that only shows up later as an opaque ComfyUI 400.
+# ===========================================================================
+FROM wlsdml1114/engui_genai-base_blackwell:1.1 AS models
+
+SHELL ["/bin/bash", "-o", "pipefail", "-e", "-c"]
+
+RUN mkdir -p /models/diffusion_models /models/loras /models/clip_vision \
+             /models/text_encoders /models/vae
+
+RUN wget -q \
+      https://huggingface.co/Kijai/WanVideo_comfy_fp8_scaled/resolve/main/I2V/Wan2_2-I2V-A14B-HIGH_fp8_e4m3fn_scaled_KJ.safetensors \
+      -O /models/diffusion_models/Wan2_2-I2V-A14B-HIGH_fp8_e4m3fn_scaled_KJ.safetensors && \
+    test -s /models/diffusion_models/Wan2_2-I2V-A14B-HIGH_fp8_e4m3fn_scaled_KJ.safetensors
+
+RUN wget -q \
+      https://huggingface.co/Kijai/WanVideo_comfy_fp8_scaled/resolve/main/I2V/Wan2_2-I2V-A14B-LOW_fp8_e4m3fn_scaled_KJ.safetensors \
+      -O /models/diffusion_models/Wan2_2-I2V-A14B-LOW_fp8_e4m3fn_scaled_KJ.safetensors && \
+    test -s /models/diffusion_models/Wan2_2-I2V-A14B-LOW_fp8_e4m3fn_scaled_KJ.safetensors
+
+RUN wget -q \
+      https://huggingface.co/lightx2v/Wan2.2-Lightning/resolve/main/Wan2.2-I2V-A14B-4steps-lora-rank64-Seko-V1/high_noise_model.safetensors \
+      -O /models/loras/high_noise_model.safetensors && \
+    test -s /models/loras/high_noise_model.safetensors
+
+RUN wget -q \
+      https://huggingface.co/lightx2v/Wan2.2-Lightning/resolve/main/Wan2.2-I2V-A14B-4steps-lora-rank64-Seko-V1/low_noise_model.safetensors \
+      -O /models/loras/low_noise_model.safetensors && \
+    test -s /models/loras/low_noise_model.safetensors
+
+RUN wget -q \
+      https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/resolve/main/split_files/clip_vision/clip_vision_h.safetensors \
+      -O /models/clip_vision/clip_vision_h.safetensors && \
+    test -s /models/clip_vision/clip_vision_h.safetensors
+
+RUN wget -q \
+      https://huggingface.co/Kijai/WanVideo_comfy/resolve/main/umt5-xxl-enc-bf16.safetensors \
+      -O /models/text_encoders/umt5-xxl-enc-bf16.safetensors && \
+    test -s /models/text_encoders/umt5-xxl-enc-bf16.safetensors
+
+RUN wget -q \
+      https://huggingface.co/Kijai/WanVideo_comfy/resolve/main/Wan2_1_VAE_bf16.safetensors \
+      -O /models/vae/Wan2_1_VAE_bf16.safetensors && \
+    test -s /models/vae/Wan2_1_VAE_bf16.safetensors
+
+
+# ===========================================================================
+# Stage 2: runtime
+#
+# Everything that isn't a model download: base image, ComfyUI, custom nodes,
+# then the models copied in from the stage above, then your code last.
+# ===========================================================================
+FROM wlsdml1114/engui_genai-base_blackwell:1.1 AS runtime
 
 # ---------------------------------------------------------------------------
 # Pinned revisions.
 #
 # Every one of these was previously cloned at HEAD, so each rebuild pulled a
-# different tree and the image was never reproducible. The SHAs below were read
-# off a worker that builds and runs correctly.
+# different tree and the image was never reproducible. The SHAs below were
+# read off a worker that builds and runs correctly.
 #
 # ComfyUI is pinned by SHA rather than by tag: the working tree is
 # v0.29.0-42-gb53e247c, i.e. 42 commits past the v0.29.0 tag and not equal to
@@ -26,14 +87,12 @@ ARG INTELLIGENTVRAM_SHA=3a3fdb41c1b0e01545d9d394304adc846cdde52b
 ARG AUTOWAN_SHA=d4f7e6294fc8d1f38c8b3acdb520c64d983099a1
 ARG ADAPTIVEWINDOW_SHA=6c46e055f63b031324a0d19f6e2adebcbe76b90b
 
-# Set to 1 to reinstate ComfyUI-Manager. It is off by default: on a headless
-# serverless worker running a fixed workflow there is no UI to use it from, and
-# it fetches the node registry over the network on every cold start.
+# Off by default: on a headless serverless worker running a fixed workflow
+# there is no UI to use it from, and it fetches the node registry over the
+# network on every cold start. Set to 1 to reinstate it.
 ARG INSTALL_COMFYUI_MANAGER=0
 ARG COMFYUI_MANAGER_SHA=d404e6234acd609da830ebb9f01e3c975313473e
 
-# Fail the build on any error in a RUN line rather than carrying on with a
-# half-populated image.
 SHELL ["/bin/bash", "-o", "pipefail", "-e", "-c"]
 
 RUN pip install -U "huggingface_hub[hf_transfer]"
@@ -101,8 +160,8 @@ RUN cd /ComfyUI/custom_nodes && \
     cd auto_wan2.2animate_freamtowindow_server && \
     git checkout ${AUTOWAN_SHA}
 
-# This repo nests its package one directory deeper than ComfyUI expects, so the
-# contents are lifted up a level after checkout.
+# This repo nests its package one directory deeper than ComfyUI expects, so
+# the contents are lifted up a level after checkout.
 RUN cd /ComfyUI/custom_nodes && \
     git clone https://github.com/eddyhhlure1Eddy/ComfyUI-AdaptiveWindowSize && \
     cd ComfyUI-AdaptiveWindowSize && \
@@ -110,54 +169,17 @@ RUN cd /ComfyUI/custom_nodes && \
     cd ComfyUI-AdaptiveWindowSize && \
     mv * ../
 
-# ---------------------------------------------------------------------------
-# Model downloads.
-#
-# `-q` is dropped and each download is size-checked. Previously a failed or
-# truncated fetch left a missing or partial file, the build still reported
-# success, and the failure only surfaced at prompt-validation time as an opaque
-# HTTP 400 from ComfyUI.
-#
-# These layers sit above `COPY . .` on purpose: editing handler.py or a
-# workflow JSON reuses them from cache instead of re-downloading ~40 GB.
-# ---------------------------------------------------------------------------
-RUN wget --progress=dot:giga \
-      https://huggingface.co/Kijai/WanVideo_comfy_fp8_scaled/resolve/main/I2V/Wan2_2-I2V-A14B-HIGH_fp8_e4m3fn_scaled_KJ.safetensors \
-      -O /ComfyUI/models/diffusion_models/Wan2_2-I2V-A14B-HIGH_fp8_e4m3fn_scaled_KJ.safetensors && \
-    test -s /ComfyUI/models/diffusion_models/Wan2_2-I2V-A14B-HIGH_fp8_e4m3fn_scaled_KJ.safetensors
+# Pulled from the `models` stage's cache rather than re-downloaded, so a
+# runtime-only change (new node, code edit) never re-fetches ~40GB.
+COPY --from=models /models/diffusion_models/ /ComfyUI/models/diffusion_models/
+COPY --from=models /models/loras/            /ComfyUI/models/loras/
+COPY --from=models /models/clip_vision/      /ComfyUI/models/clip_vision/
+COPY --from=models /models/text_encoders/    /ComfyUI/models/text_encoders/
+COPY --from=models /models/vae/              /ComfyUI/models/vae/
 
-RUN wget --progress=dot:giga \
-      https://huggingface.co/Kijai/WanVideo_comfy_fp8_scaled/resolve/main/I2V/Wan2_2-I2V-A14B-LOW_fp8_e4m3fn_scaled_KJ.safetensors \
-      -O /ComfyUI/models/diffusion_models/Wan2_2-I2V-A14B-LOW_fp8_e4m3fn_scaled_KJ.safetensors && \
-    test -s /ComfyUI/models/diffusion_models/Wan2_2-I2V-A14B-LOW_fp8_e4m3fn_scaled_KJ.safetensors
-
-RUN wget --progress=dot:giga \
-      https://huggingface.co/lightx2v/Wan2.2-Lightning/resolve/main/Wan2.2-I2V-A14B-4steps-lora-rank64-Seko-V1/high_noise_model.safetensors \
-      -O /ComfyUI/models/loras/high_noise_model.safetensors && \
-    test -s /ComfyUI/models/loras/high_noise_model.safetensors
-
-RUN wget --progress=dot:giga \
-      https://huggingface.co/lightx2v/Wan2.2-Lightning/resolve/main/Wan2.2-I2V-A14B-4steps-lora-rank64-Seko-V1/low_noise_model.safetensors \
-      -O /ComfyUI/models/loras/low_noise_model.safetensors && \
-    test -s /ComfyUI/models/loras/low_noise_model.safetensors
-
-RUN wget --progress=dot:giga \
-      https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/resolve/main/split_files/clip_vision/clip_vision_h.safetensors \
-      -O /ComfyUI/models/clip_vision/clip_vision_h.safetensors && \
-    test -s /ComfyUI/models/clip_vision/clip_vision_h.safetensors
-
-RUN wget --progress=dot:giga \
-      https://huggingface.co/Kijai/WanVideo_comfy/resolve/main/umt5-xxl-enc-bf16.safetensors \
-      -O /ComfyUI/models/text_encoders/umt5-xxl-enc-bf16.safetensors && \
-    test -s /ComfyUI/models/text_encoders/umt5-xxl-enc-bf16.safetensors
-
-RUN wget --progress=dot:giga \
-      https://huggingface.co/Kijai/WanVideo_comfy/resolve/main/Wan2_1_VAE_bf16.safetensors \
-      -O /ComfyUI/models/vae/Wan2_1_VAE_bf16.safetensors && \
-    test -s /ComfyUI/models/vae/Wan2_1_VAE_bf16.safetensors
-
-# LoadImage resolves names against this directory, and the handler stages every
-# input image into it. Created here so the first request never races on mkdir.
+# LoadImage resolves names against this directory, and the handler stages
+# every input image into it. Created here so the first request never races
+# on mkdir.
 RUN mkdir -p /ComfyUI/input
 
 # Report what actually landed in the image, so a bad build is visible in the
