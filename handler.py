@@ -8,8 +8,10 @@ import uuid
 import logging
 import random
 import urllib.request
+import urllib.error
 import urllib.parse
 import binascii  # imported for Base64 error handling
+import shutil
 import subprocess
 import time
 
@@ -67,6 +69,9 @@ NODE_LORA_HIGH = "279"
 NODE_LORA_LOW = "553"
 
 MAX_SEED = 2**53 - 1
+
+# ComfyUI resolves LoadImage names against this directory.
+COMFY_INPUT_DIR = os.getenv("COMFY_INPUT_DIR", "/ComfyUI/input")
 
 # Fraction of total steps handled by the high-noise expert. The shipped graph
 # uses 4 of 8. Composition and motion are settled in this half; detail and
@@ -154,14 +159,58 @@ def save_base64_to_file(base64_data, temp_dir, output_filename):
         raise Exception(f"Base64 decode failed: {e}")
 
 
+def stage_for_comfy(src_path, dest_name):
+    """Copy an image into ComfyUI's input directory, return the bare filename.
+
+    LoadImage resolves and validates its `image` field against ComfyUI's own
+    input directory. Current ComfyUI rejects absolute paths that point outside
+    it, which is why passing /task_<uuid>/input_image.jpg produced:
+
+        LoadImage 244: Invalid image file: /task_.../input_image.jpg
+
+    Anything that arrives as base64, a URL download, or a network-volume path
+    has to be copied here first and referenced by name.
+    """
+    if not os.path.exists(src_path):
+        raise Exception(f"Input image does not exist: {src_path}")
+
+    size = os.path.getsize(src_path)
+    if size == 0:
+        raise Exception(f"Input image is empty (0 bytes): {src_path}")
+
+    os.makedirs(COMFY_INPUT_DIR, exist_ok=True)
+    dest_path = os.path.join(COMFY_INPUT_DIR, dest_name)
+    shutil.copyfile(src_path, dest_path)
+    logger.info(f"Staged input image: {src_path} -> {dest_path} ({size} bytes)")
+    return dest_name
+
+
+# ---------------------------------------------------------------------------
+# REPLACE the existing handler() with this one.
+# Requires `import shutil` at the top of the file.
+# ---------------------------------------------------------------------------
+
+
 def queue_prompt(prompt):
     url = f"http://{server_address}:8188/prompt"
     logger.info(f"Queueing prompt to: {url}")
     p = {"prompt": prompt, "client_id": client_id}
     data = json.dumps(p).encode('utf-8')
     req = urllib.request.Request(url, data=data)
-    return json.loads(urllib.request.urlopen(req).read())
+    try:
+        return json.loads(urllib.request.urlopen(req).read())
+    except urllib.error.HTTPError as e:
+        try:
+            body = e.read().decode('utf-8', 'replace')
+        except Exception:
+            body = "<no response body>"
+        logger.error(f"ComfyUI rejected the prompt ({e.code}): {body}")
+        raise Exception(f"ComfyUI rejected the prompt ({e.code}): {body[:2000]}") from e
 
+
+# ---------------------------------------------------------------------------
+# NEW helper. Put it next to process_input.
+# ---------------------------------------------------------------------------
 
 def get_image(filename, subfolder, folder_type):
     url = f"http://{server_address}:8188/view"
@@ -340,6 +389,9 @@ def handler(job):
         image_path = "/example_image.png"
         logger.info("Using the default image file: /example_image.png")
 
+    # LoadImage only accepts names inside ComfyUI's input directory.
+    image_name = stage_for_comfy(image_path, f"{task_id}_input.jpg")
+
     # ---- end image input (FLF2V) -----------------------------------------
     end_image_path_local = None
     if "end_image_path" in job_input:
@@ -349,6 +401,10 @@ def handler(job):
     elif "end_image_base64" in job_input:
         end_image_path_local = process_input(job_input["end_image_base64"], task_id, "end_image.jpg", "base64")
 
+    end_image_name = None
+    if end_image_path_local:
+        end_image_name = stage_for_comfy(end_image_path_local, f"{task_id}_end.jpg")
+
     # ---- workflow selection ----------------------------------------------
     lora_pairs = job_input.get("lora_pairs", []) or []
     if len(lora_pairs) > 4:
@@ -357,9 +413,9 @@ def handler(job):
         )
         lora_pairs = lora_pairs[:4]
 
-    workflow_file = "/new_Wan22_flf2v_api.json" if end_image_path_local else "/new_Wan22_api.json"
+    workflow_file = "/new_Wan22_flf2v_api.json" if end_image_name else "/new_Wan22_api.json"
     logger.info(
-        f"Using {'FLF2V' if end_image_path_local else 'single'} workflow "
+        f"Using {'FLF2V' if end_image_name else 'single'} workflow "
         f"with {len(lora_pairs)} LoRA pair(s)"
     )
     prompt = load_workflow(workflow_file)
@@ -388,7 +444,9 @@ def handler(job):
         logger.info(f"Height adjusted to nearest multiple of 16: {original_height} -> {adjusted_height}")
 
     # ---- write into the graph --------------------------------------------
-    prompt[NODE_IMAGE]["inputs"]["image"] = image_path
+    # Bare filename, not an absolute path: LoadImage resolves it against
+    # ComfyUI's input directory.
+    prompt[NODE_IMAGE]["inputs"]["image"] = image_name
     prompt[NODE_TEXT]["inputs"]["positive_prompt"] = positive_prompt
     prompt[NODE_TEXT]["inputs"]["negative_prompt"] = negative_prompt
     prompt[NODE_WIDTH]["inputs"]["value"] = adjusted_width
@@ -402,9 +460,9 @@ def handler(job):
     applied_steps = apply_steps(prompt, steps)
     applied_cfg = apply_cfg(prompt, cfg)
 
-    if end_image_path_local:
+    if end_image_name:
         if NODE_END_IMAGE in prompt:
-            prompt[NODE_END_IMAGE]["inputs"]["image"] = end_image_path_local
+            prompt[NODE_END_IMAGE]["inputs"]["image"] = end_image_name
         else:
             logger.warning(
                 f"Node {NODE_END_IMAGE} not found in {workflow_file}, end image not applied."
@@ -444,8 +502,19 @@ def handler(job):
                 raise Exception("WebSocket connection timed out (3 minutes)")
             time.sleep(5)
 
-    videos = get_videos(ws, prompt)
-    ws.close()
+    try:
+        videos = get_videos(ws, prompt)
+    finally:
+        ws.close()
+        # Staged copies are per-job and never reused. Left in place they
+        # accumulate in the image layer for the life of the worker.
+        for name in (image_name, end_image_name):
+            if not name:
+                continue
+            try:
+                os.remove(os.path.join(COMFY_INPUT_DIR, name))
+            except OSError:
+                pass
 
     for node_id in videos:
         if videos[node_id]:
