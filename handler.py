@@ -6,90 +6,154 @@ import base64
 import json
 import uuid
 import logging
+import random
 import urllib.request
 import urllib.parse
-import binascii # Base64 에러 처리를 위해 import
+import binascii  # imported for Base64 error handling
 import subprocess
 import time
-# 로깅 설정
+
+# Logging configuration
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-
 server_address = os.getenv('SERVER_ADDRESS', '127.0.0.1')
 client_id = str(uuid.uuid4())
+
+# ---------------------------------------------------------------------------
+# Node map for new_Wan22_api.json / new_Wan22_flf2v_api.json
+#
+#   244 LoadImage                    -> image
+#   617 LoadImage                    -> end image (FLF2V workflow only)
+#   135 WanVideoTextEncode           -> positive_prompt / negative_prompt
+#   235 INTConstant                  -> width
+#   236 INTConstant                  -> height
+#   541 WanVideoImageToVideoEncode   -> num_frames
+#   498 WanVideoContextOptions       -> context_frames / context_overlap
+#   220 WanVideoSampler (HIGH)       -> seed;  steps <- 569, end_step   <- 575
+#   540 WanVideoSampler (LOW)        -> seed;  steps <- 569, start_step <- 575
+#   569 INTConstant                  -> total step count
+#   575 INTConstant                  -> high/low split point
+#   570 CreateCFGScheduleFloatList   -> CFG schedule feeding node 220
+#   279 WanVideoLoraSelectMulti      -> HIGH LoRA slots (lora_0 is Lightning)
+#   553 WanVideoLoraSelectMulti      -> LOW  LoRA slots (lora_0 is Lightning)
+#
+# Two corrections against the upstream handler:
+#
+#  1. CFG was written to node 540, the LOW-noise sampler. That sampler is
+#     Lightning-distilled and ships at cfg 1.0 on purpose. Any value above 1.0
+#     doubles the forward passes per step (classifier-free guidance runs the
+#     model twice) for guidance the distilled pass was not trained to use, so
+#     it cost roughly 2x on half the run AND degraded output. CFG belongs on
+#     node 570, whose schedule feeds the HIGH-noise sampler.
+#
+#  2. The steps block targeted nodes 834 / 829, which belong to the ksampler
+#     branch's workflow and do not exist here. Guarded by `if "834" in prompt`,
+#     so it silently did nothing. The real controls are nodes 569 and 575.
+# ---------------------------------------------------------------------------
+NODE_IMAGE = "244"
+NODE_END_IMAGE = "617"
+NODE_TEXT = "135"
+NODE_WIDTH = "235"
+NODE_HEIGHT = "236"
+NODE_I2V_ENCODE = "541"
+NODE_CONTEXT = "498"
+NODE_SAMPLER_HIGH = "220"
+NODE_SAMPLER_LOW = "540"
+NODE_STEPS = "569"
+NODE_SPLIT = "575"
+NODE_CFG_SCHEDULE = "570"
+NODE_LORA_HIGH = "279"
+NODE_LORA_LOW = "553"
+
+MAX_SEED = 2**53 - 1
+
+# Fraction of total steps handled by the high-noise expert. The shipped graph
+# uses 4 of 8. Composition and motion are settled in this half; detail and
+# refinement happen in the low-noise half.
+HIGH_NOISE_FRACTION = 0.5
+
+DEFAULT_NEGATIVE = (
+    "bright tones, overexposed, static, blurred details, subtitles, style, "
+    "works, paintings, images, static, overall gray, worst quality, low quality, "
+    "JPEG compression residue, ugly, incomplete, extra fingers, poorly drawn hands, "
+    "poorly drawn faces, deformed, disfigured, misshapen limbs, fused fingers, "
+    "still picture, messy background, three legs, many people in the background, "
+    "walking backwards"
+)
+
+
 def to_nearest_multiple_of_16(value):
-    """주어진 값을 가장 가까운 16의 배수로 보정, 최소 16 보장"""
+    """Round the given value to the nearest multiple of 16, minimum 16."""
     try:
         numeric_value = float(value)
     except Exception:
-        raise Exception(f"width/height 값이 숫자가 아닙니다: {value}")
+        raise Exception(f"width/height value is not a number: {value}")
     adjusted = int(round(numeric_value / 16.0) * 16)
     if adjusted < 16:
         adjusted = 16
     return adjusted
+
+
 def process_input(input_data, temp_dir, output_filename, input_type):
-    """입력 데이터를 처리하여 파일 경로를 반환하는 함수"""
+    """Process the input data and return a usable file path."""
     if input_type == "path":
-        # 경로인 경우 그대로 반환
-        logger.info(f"📁 경로 입력 처리: {input_data}")
+        logger.info(f"Handling path input: {input_data}")
         return input_data
     elif input_type == "url":
-        # URL인 경우 다운로드
-        logger.info(f"🌐 URL 입력 처리: {input_data}")
+        logger.info(f"Handling URL input: {input_data}")
         os.makedirs(temp_dir, exist_ok=True)
         file_path = os.path.abspath(os.path.join(temp_dir, output_filename))
         return download_file_from_url(input_data, file_path)
     elif input_type == "base64":
-        # Base64인 경우 디코딩하여 저장
-        logger.info(f"🔢 Base64 입력 처리")
+        logger.info("Handling Base64 input")
         return save_base64_to_file(input_data, temp_dir, output_filename)
     else:
-        raise Exception(f"지원하지 않는 입력 타입: {input_type}")
+        raise Exception(f"Unsupported input type: {input_type}")
 
-        
+
 def download_file_from_url(url, output_path):
-    """URL에서 파일을 다운로드하는 함수"""
+    """Download a file from a URL."""
     try:
-        # wget을 사용하여 파일 다운로드
-        result = subprocess.run([
-            'wget', '-O', output_path, '--no-verbose', url
-        ], capture_output=True, text=True)
-        
+        result = subprocess.run(
+            ['wget', '-O', output_path, '--no-verbose', url],
+            capture_output=True, text=True
+        )
         if result.returncode == 0:
-            logger.info(f"✅ URL에서 파일을 성공적으로 다운로드했습니다: {url} -> {output_path}")
+            logger.info(f"Downloaded file from URL: {url} -> {output_path}")
             return output_path
         else:
-            logger.error(f"❌ wget 다운로드 실패: {result.stderr}")
-            raise Exception(f"URL 다운로드 실패: {result.stderr}")
+            logger.error(f"wget download failed: {result.stderr}")
+            raise Exception(f"URL download failed: {result.stderr}")
     except subprocess.TimeoutExpired:
-        logger.error("❌ 다운로드 시간 초과")
-        raise Exception("다운로드 시간 초과")
+        logger.error("Download timed out")
+        raise Exception("Download timed out")
     except Exception as e:
-        logger.error(f"❌ 다운로드 중 오류 발생: {e}")
-        raise Exception(f"다운로드 중 오류 발생: {e}")
+        logger.error(f"Error during download: {e}")
+        raise Exception(f"Error during download: {e}")
 
 
 def save_base64_to_file(base64_data, temp_dir, output_filename):
-    """Base64 데이터를 파일로 저장하는 함수"""
+    """Decode Base64 data and save it to a file."""
     try:
-        # Base64 문자열 디코딩
+        # Strip the data URI prefix if present. The README's own examples send
+        # "data:image/jpeg;base64,...", which the original code fed straight to
+        # b64decode and crashed on.
+        if isinstance(base64_data, str) and base64_data.startswith("data:"):
+            base64_data = base64_data.split(",", 1)[-1]
+
         decoded_data = base64.b64decode(base64_data)
-        
-        # 디렉토리가 존재하지 않으면 생성
         os.makedirs(temp_dir, exist_ok=True)
-        
-        # 파일로 저장
         file_path = os.path.abspath(os.path.join(temp_dir, output_filename))
         with open(file_path, 'wb') as f:
             f.write(decoded_data)
-        
-        logger.info(f"✅ Base64 입력을 '{file_path}' 파일로 저장했습니다.")
+        logger.info(f"Saved Base64 input to file: '{file_path}'")
         return file_path
     except (binascii.Error, ValueError) as e:
-        logger.error(f"❌ Base64 디코딩 실패: {e}")
-        raise Exception(f"Base64 디코딩 실패: {e}")
-    
+        logger.error(f"Base64 decode failed: {e}")
+        raise Exception(f"Base64 decode failed: {e}")
+
+
 def queue_prompt(prompt):
     url = f"http://{server_address}:8188/prompt"
     logger.info(f"Queueing prompt to: {url}")
@@ -97,6 +161,7 @@ def queue_prompt(prompt):
     data = json.dumps(p).encode('utf-8')
     req = urllib.request.Request(url, data=data)
     return json.loads(urllib.request.urlopen(req).read())
+
 
 def get_image(filename, subfolder, folder_type):
     url = f"http://{server_address}:8188/view"
@@ -106,11 +171,13 @@ def get_image(filename, subfolder, folder_type):
     with urllib.request.urlopen(f"{url}?{url_values}") as response:
         return response.read()
 
+
 def get_history(prompt_id):
     url = f"http://{server_address}:8188/history/{prompt_id}"
     logger.info(f"Getting history from: {url}")
     with urllib.request.urlopen(url) as response:
         return json.loads(response.read())
+
 
 def get_videos(ws, prompt):
     prompt_id = queue_prompt(prompt)['prompt_id']
@@ -132,7 +199,6 @@ def get_videos(ws, prompt):
         videos_output = []
         if 'gifs' in node_output:
             for video in node_output['gifs']:
-                # fullpath를 이용하여 직접 파일을 읽고 base64로 인코딩
                 with open(video['fullpath'], 'rb') as f:
                     video_data = base64.b64encode(f.read()).decode('utf-8')
                 videos_output.append(video_data)
@@ -140,18 +206,130 @@ def get_videos(ws, prompt):
 
     return output_videos
 
+
 def load_workflow(workflow_path):
-    with open(workflow_path, 'r') as file:
+    with open(workflow_path, 'r', encoding='utf-8') as file:
         return json.load(file)
+
+
+def resolve_seed(job_input):
+    """Return the seed to use. Omitted or -1 means a fresh random one."""
+    raw_seed = job_input.get("seed", None)
+    if raw_seed is None or raw_seed == -1:
+        seed = random.randint(0, MAX_SEED)
+        logger.info(f"No seed supplied -> using random seed: {seed}")
+        return seed
+    try:
+        seed = int(raw_seed) % (MAX_SEED + 1)
+    except Exception:
+        raise Exception(f"seed value is not an integer: {raw_seed}")
+    logger.info(f"Seed applied: {seed}")
+    return seed
+
+
+def apply_steps(prompt, steps):
+    """Set the total step count and the high/low split point.
+
+    Node 569 feeds `steps` on both samplers and `steps` on the CFG schedule.
+    Node 575 feeds `end_step` on the high sampler and `start_step` on the low
+    sampler, so it is the boundary between the two experts.
+    """
+    try:
+        total_steps = int(steps)
+    except Exception:
+        raise Exception(f"steps value is not an integer: {steps}")
+    if total_steps < 2:
+        logger.warning(f"steps={total_steps} is too small. Clamping to 2.")
+        total_steps = 2
+
+    split_at = max(1, min(total_steps - 1, round(total_steps * HIGH_NOISE_FRACTION)))
+
+    if NODE_STEPS in prompt:
+        prompt[NODE_STEPS]["inputs"]["value"] = total_steps
+    else:
+        logger.warning(f"Node {NODE_STEPS} not found, total steps not applied.")
+    if NODE_SPLIT in prompt:
+        prompt[NODE_SPLIT]["inputs"]["value"] = split_at
+    else:
+        logger.warning(f"Node {NODE_SPLIT} not found, split point not applied.")
+
+    logger.info(
+        f"Steps applied: {total_steps} total "
+        f"(high-noise 0-{split_at} / low-noise {split_at}-end)"
+    )
+    return total_steps
+
+
+def apply_cfg(prompt, cfg):
+    """Set the CFG schedule that feeds the HIGH-noise sampler.
+
+    The LOW-noise sampler stays at its shipped 1.0. Raising it there does not
+    improve prompt adherence, it just runs the distilled model twice per step.
+    """
+    try:
+        cfg_value = float(cfg)
+    except Exception:
+        raise Exception(f"cfg value is not a number: {cfg}")
+
+    if NODE_CFG_SCHEDULE in prompt:
+        prompt[NODE_CFG_SCHEDULE]["inputs"]["cfg_scale_start"] = cfg_value
+        prompt[NODE_CFG_SCHEDULE]["inputs"]["cfg_scale_end"] = cfg_value
+        logger.info(f"CFG applied to high-noise schedule (node {NODE_CFG_SCHEDULE}): {cfg_value}")
+    else:
+        logger.warning(
+            f"Node {NODE_CFG_SCHEDULE} (CreateCFGScheduleFloatList) not found, "
+            f"CFG not applied."
+        )
+    return cfg_value
+
+
+def apply_loras(prompt, lora_pairs):
+    """Write user LoRAs into the HIGH (279) and LOW (553) selector nodes.
+
+    Slot 0 on each node holds the Lightning distillation LoRA and must not be
+    touched, so user LoRAs start at slot 1. Each node has slots 0-4, leaving
+    four usable slots.
+    """
+    if not lora_pairs:
+        return 0
+
+    if NODE_LORA_HIGH not in prompt or NODE_LORA_LOW not in prompt:
+        logger.warning("LoRA selector nodes not found, LoRAs not applied.")
+        return 0
+
+    applied = 0
+    for i, lora_pair in enumerate(lora_pairs[:4]):
+        slot = i + 1  # slot 0 is reserved for the Lightning LoRA
+        lora_high = lora_pair.get("high")
+        lora_low = lora_pair.get("low")
+        high_weight = lora_pair.get("high_weight", 1.0)
+        low_weight = lora_pair.get("low_weight", 1.0)
+
+        if lora_high:
+            prompt[NODE_LORA_HIGH]["inputs"][f"lora_{slot}"] = lora_high
+            prompt[NODE_LORA_HIGH]["inputs"][f"strength_{slot}"] = high_weight
+            logger.info(
+                f"LoRA {slot} HIGH -> node {NODE_LORA_HIGH}: {lora_high} @ {high_weight}"
+            )
+            applied += 1
+
+        if lora_low:
+            prompt[NODE_LORA_LOW]["inputs"][f"lora_{slot}"] = lora_low
+            prompt[NODE_LORA_LOW]["inputs"][f"strength_{slot}"] = low_weight
+            logger.info(
+                f"LoRA {slot} LOW  -> node {NODE_LORA_LOW}: {lora_low} @ {low_weight}"
+            )
+
+    return applied
+
 
 def handler(job):
     job_input = job.get("input", {})
 
-    logger.info(f"Received job input: {job_input}")
+    logger.info(f"Received job input: { {k: v for k, v in job_input.items() if 'base64' not in k} }")
     task_id = f"task_{uuid.uuid4()}"
 
-    # 이미지 입력 처리 (image_path, image_url, image_base64 중 하나만 사용)
-    image_path = None
+    # ---- image input (use only one of path / url / base64) ----------------
     if "image_path" in job_input:
         image_path = process_input(job_input["image_path"], task_id, "input_image.jpg", "path")
     elif "image_url" in job_input:
@@ -159,11 +337,10 @@ def handler(job):
     elif "image_base64" in job_input:
         image_path = process_input(job_input["image_base64"], task_id, "input_image.jpg", "base64")
     else:
-        # 기본값 사용
         image_path = "/example_image.png"
-        logger.info("기본 이미지 파일을 사용합니다: /example_image.png")
+        logger.info("Using the default image file: /example_image.png")
 
-    # 엔드 이미지 입력 처리 (end_image_path, end_image_url, end_image_base64 중 하나만 사용)
+    # ---- end image input (FLF2V) -----------------------------------------
     end_image_path_local = None
     if "end_image_path" in job_input:
         end_image_path_local = process_input(job_input["end_image_path"], task_id, "end_image.jpg", "path")
@@ -171,129 +348,121 @@ def handler(job):
         end_image_path_local = process_input(job_input["end_image_url"], task_id, "end_image.jpg", "url")
     elif "end_image_base64" in job_input:
         end_image_path_local = process_input(job_input["end_image_base64"], task_id, "end_image.jpg", "base64")
-    
-    # LoRA 설정 확인 - 배열로 받아서 처리
-    lora_pairs = job_input.get("lora_pairs", [])
-    
-    # 최대 4개 LoRA까지 지원
-    lora_count = min(len(lora_pairs), 4)
-    if lora_count > len(lora_pairs):
-        logger.warning(f"LoRA 개수가 {len(lora_pairs)}개입니다. 최대 4개까지만 지원됩니다. 처음 4개만 사용합니다.")
-        lora_pairs = lora_pairs[:4]
-    
-    # 워크플로우 파일 선택 (end_image_*가 있으면 FLF2V 워크플로 사용)
-    workflow_file = "/new_Wan22_flf2v_api.json" if end_image_path_local else "/new_Wan22_api.json"
-    logger.info(f"Using {'FLF2V' if end_image_path_local else 'single'} workflow with {lora_count} LoRA pairs")
-    
-    prompt = load_workflow(workflow_file)
-    
-    length = job_input.get("length", 81)
-    steps = job_input.get("steps", 10)
 
-    prompt["244"]["inputs"]["image"] = image_path
-    prompt["541"]["inputs"]["num_frames"] = length
-    prompt["135"]["inputs"]["positive_prompt"] = job_input["prompt"]
-    prompt["135"]["inputs"]["negative_prompt"] = job_input.get("negative_prompt", "bright tones, overexposed, static, blurred details, subtitles, style, works, paintings, images, static, overall gray, worst quality, low quality, JPEG compression residue, ugly, incomplete, extra fingers, poorly drawn hands, poorly drawn faces, deformed, disfigured, misshapen limbs, fused fingers, still picture, messy background, three legs, many people in the background, walking backwards")
-    prompt["220"]["inputs"]["seed"] = job_input["seed"]
-    prompt["540"]["inputs"]["seed"] = job_input["seed"]
-    prompt["540"]["inputs"]["cfg"] = job_input["cfg"]
-    # 해상도(폭/높이) 16배수 보정
-    original_width = job_input["width"]
-    original_height = job_input["height"]
+    # ---- workflow selection ----------------------------------------------
+    lora_pairs = job_input.get("lora_pairs", []) or []
+    if len(lora_pairs) > 4:
+        logger.warning(
+            f"{len(lora_pairs)} LoRA pairs supplied. Only 4 are supported. Using the first 4."
+        )
+        lora_pairs = lora_pairs[:4]
+
+    workflow_file = "/new_Wan22_flf2v_api.json" if end_image_path_local else "/new_Wan22_api.json"
+    logger.info(
+        f"Using {'FLF2V' if end_image_path_local else 'single'} workflow "
+        f"with {len(lora_pairs)} LoRA pair(s)"
+    )
+    prompt = load_workflow(workflow_file)
+
+    # ---- parameters -------------------------------------------------------
+    # All read with .get() and a default. The original indexed job_input
+    # directly for prompt/seed/cfg/width/height, so omitting any one of them
+    # raised a KeyError and failed the job.
+    length = job_input.get("length", 81)
+    steps = job_input.get("steps", 8)
+    cfg = job_input.get("cfg", 2.0)
+    seed = resolve_seed(job_input)
+
+    positive_prompt = job_input.get("prompt", "")
+    if not positive_prompt:
+        raise Exception("A 'prompt' is required.")
+    negative_prompt = job_input.get("negative_prompt", DEFAULT_NEGATIVE)
+
+    original_width = job_input.get("width", 480)
+    original_height = job_input.get("height", 832)
     adjusted_width = to_nearest_multiple_of_16(original_width)
     adjusted_height = to_nearest_multiple_of_16(original_height)
     if adjusted_width != original_width:
         logger.info(f"Width adjusted to nearest multiple of 16: {original_width} -> {adjusted_width}")
     if adjusted_height != original_height:
         logger.info(f"Height adjusted to nearest multiple of 16: {original_height} -> {adjusted_height}")
-    prompt["235"]["inputs"]["value"] = adjusted_width
-    prompt["236"]["inputs"]["value"] = adjusted_height
-    prompt["498"]["inputs"]["context_overlap"] = job_input.get("context_overlap", 48)
-    prompt["498"]["inputs"]["context_frames"] = length
 
-    # step 설정 적용
-    if "834" in prompt:
-        prompt["834"]["inputs"]["steps"] = steps
-        logger.info(f"Steps set to: {steps}")
-        lowsteps = int(steps*0.6)
-        prompt["829"]["inputs"]["step"] = lowsteps
-        logger.info(f"LowSteps set to: {lowsteps}")
+    # ---- write into the graph --------------------------------------------
+    prompt[NODE_IMAGE]["inputs"]["image"] = image_path
+    prompt[NODE_TEXT]["inputs"]["positive_prompt"] = positive_prompt
+    prompt[NODE_TEXT]["inputs"]["negative_prompt"] = negative_prompt
+    prompt[NODE_WIDTH]["inputs"]["value"] = adjusted_width
+    prompt[NODE_HEIGHT]["inputs"]["value"] = adjusted_height
+    prompt[NODE_I2V_ENCODE]["inputs"]["num_frames"] = length
+    prompt[NODE_CONTEXT]["inputs"]["context_frames"] = length
+    prompt[NODE_CONTEXT]["inputs"]["context_overlap"] = job_input.get("context_overlap", 48)
+    prompt[NODE_SAMPLER_HIGH]["inputs"]["seed"] = seed
+    prompt[NODE_SAMPLER_LOW]["inputs"]["seed"] = seed
 
-    # 엔드 이미지가 있는 경우 617번 노드에 경로 적용 (FLF2V 전용)
+    applied_steps = apply_steps(prompt, steps)
+    applied_cfg = apply_cfg(prompt, cfg)
+
     if end_image_path_local:
-        prompt["617"]["inputs"]["image"] = end_image_path_local
-    
-    # LoRA 설정 적용 - HIGH LoRA는 노드 279, LOW LoRA는 노드 553
-    if lora_count > 0:
-        # HIGH LoRA 노드 (279번)
-        high_lora_node_id = "279"
-        
-        # LOW LoRA 노드 (553번)
-        low_lora_node_id = "553"
-        
-        # 입력받은 LoRA pairs 적용 (lora_1부터 시작)
-        for i, lora_pair in enumerate(lora_pairs):
-            if i < 4:  # 최대 4개까지만
-                lora_high = lora_pair.get("high")
-                lora_low = lora_pair.get("low")
-                lora_high_weight = lora_pair.get("high_weight", 1.0)
-                lora_low_weight = lora_pair.get("low_weight", 1.0)
-                
-                # HIGH LoRA 설정 (노드 279번, lora_1부터 시작)
-                if lora_high:
-                    prompt[high_lora_node_id]["inputs"][f"lora_{i+1}"] = lora_high
-                    prompt[high_lora_node_id]["inputs"][f"strength_{i+1}"] = lora_high_weight
-                    logger.info(f"LoRA {i+1} HIGH applied to node 279: {lora_high} with weight {lora_high_weight}")
-                
-                # LOW LoRA 설정 (노드 553번, lora_1부터 시작)
-                if lora_low:
-                    prompt[low_lora_node_id]["inputs"][f"lora_{i+1}"] = lora_low
-                    prompt[low_lora_node_id]["inputs"][f"strength_{i+1}"] = lora_low_weight
-                    logger.info(f"LoRA {i+1} LOW applied to node 553: {lora_low} with weight {lora_low_weight}")
+        if NODE_END_IMAGE in prompt:
+            prompt[NODE_END_IMAGE]["inputs"]["image"] = end_image_path_local
+        else:
+            logger.warning(
+                f"Node {NODE_END_IMAGE} not found in {workflow_file}, end image not applied."
+            )
 
+    apply_loras(prompt, lora_pairs)
+
+    # ---- run --------------------------------------------------------------
     ws_url = f"ws://{server_address}:8188/ws?clientId={client_id}"
     logger.info(f"Connecting to WebSocket: {ws_url}")
-    
-    # 먼저 HTTP 연결이 가능한지 확인
+
     http_url = f"http://{server_address}:8188/"
     logger.info(f"Checking HTTP connection to: {http_url}")
-    
-    # HTTP 연결 확인 (최대 1분)
+
     max_http_attempts = 180
     for http_attempt in range(max_http_attempts):
         try:
-            import urllib.request
             response = urllib.request.urlopen(http_url, timeout=5)
-            logger.info(f"HTTP 연결 성공 (시도 {http_attempt+1})")
+            logger.info(f"HTTP connection succeeded (attempt {http_attempt+1})")
             break
         except Exception as e:
-            logger.warning(f"HTTP 연결 실패 (시도 {http_attempt+1}/{max_http_attempts}): {e}")
+            logger.warning(f"HTTP connection failed (attempt {http_attempt+1}/{max_http_attempts}): {e}")
             if http_attempt == max_http_attempts - 1:
-                raise Exception("ComfyUI 서버에 연결할 수 없습니다. 서버가 실행 중인지 확인하세요.")
+                raise Exception("Could not connect to the ComfyUI server. Check that it is running.")
             time.sleep(1)
-    
+
     ws = websocket.WebSocket()
-    # 웹소켓 연결 시도 (최대 3분)
-    max_attempts = int(180/5)  # 3분 (1초에 한 번씩 시도)
+    max_attempts = int(180 / 5)
     for attempt in range(max_attempts):
-        import time
         try:
             ws.connect(ws_url)
-            logger.info(f"웹소켓 연결 성공 (시도 {attempt+1})")
+            logger.info(f"WebSocket connection succeeded (attempt {attempt+1})")
             break
         except Exception as e:
-            logger.warning(f"웹소켓 연결 실패 (시도 {attempt+1}/{max_attempts}): {e}")
+            logger.warning(f"WebSocket connection failed (attempt {attempt+1}/{max_attempts}): {e}")
             if attempt == max_attempts - 1:
-                raise Exception("웹소켓 연결 시간 초과 (3분)")
+                raise Exception("WebSocket connection timed out (3 minutes)")
             time.sleep(5)
+
     videos = get_videos(ws, prompt)
     ws.close()
 
-    # 이미지가 없는 경우 처리
     for node_id in videos:
         if videos[node_id]:
-            return {"video": videos[node_id][0]}
-    
-    return {"error": "비디오를를 찾을 수 없습니다."}
+            # Echo back the settings actually used so a good result can be
+            # reproduced. Extra keys are ignored by clients that only read
+            # "video".
+            return {
+                "video": videos[node_id][0],
+                "seed": seed,
+                "steps": applied_steps,
+                "cfg": applied_cfg,
+                "width": adjusted_width,
+                "height": adjusted_height,
+                "length": length,
+            }
+
+    return {"error": "Video not found."}
+
 
 runpod.serverless.start({"handler": handler})
